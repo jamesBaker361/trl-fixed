@@ -277,8 +277,7 @@ class DDPOTrainer(BaseTrainer):
                 "epoch": epoch,
                 "reward_mean": rewards.mean(),
                 "reward_std": rewards.std(),
-            },
-            step=global_step,
+            }
         )
 
         if self.config.per_prompt_stat_tracking:
