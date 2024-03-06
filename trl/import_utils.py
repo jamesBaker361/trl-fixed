@@ -41,9 +41,16 @@ def is_accelerate_greater_20_0() -> bool:
     return accelerate_version >= "0.20.0"
 
 
-def is_transformers_greater_than(version: str) -> bool:
-    _transformers_version = importlib.metadata.version("transformers")
-    return _transformers_version > version
+def is_transformers_greater_than(current_version: str) -> bool:
+    if _is_python_greater_3_8:
+        from importlib.metadata import version
+
+        _transformers_version = version("transformers")
+    else:
+        import pkg_resources
+
+        _transformers_version = pkg_resources.get_distribution("transformers").version
+    return _transformers_version > current_version
 
 
 def is_torch_greater_2_0() -> bool:
@@ -63,7 +70,10 @@ def is_diffusers_available() -> bool:
 
 
 def is_bitsandbytes_available() -> bool:
-    return importlib.util.find_spec("bitsandbytes") is not None
+    import torch
+
+    # bnb can be imported without GPU but is not usable.
+    return importlib.util.find_spec("bitsandbytes") is not None and torch.cuda.is_available()
 
 
 def is_torchvision_available() -> bool:

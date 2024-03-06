@@ -16,7 +16,7 @@ import inspect
 import random
 import warnings
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from functools import wraps
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
@@ -25,6 +25,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from accelerate import PartialState
 from accelerate.utils import is_deepspeed_available, tqdm
 from datasets import Dataset
 from torch.utils.data import DataLoader
@@ -120,27 +121,37 @@ class DPOTrainer(Trainer):
             The function to use to compute the metrics. Must take a `EvalPrediction` and return
             a dictionary string to metric values.
         precompute_ref_log_probs (`bool`, defaults to `False`):
-            Flag to precompute reference model log probabilities and evaluation datasets. This is useful if you want to train
+            Flag to precompute reference model log probabilities for training and evaluation datasets. This is useful if you want to train
             without the reference model and reduce the total GPU memory needed.
-        model_init_kwargs: (`Optional[Dict]`, *optional*):
+        dataset_num_proc (`Optional[int]`, *optional*):
+            The number of workers to use to tokenize the data. Defaults to None.
+        model_init_kwargs (`Optional[Dict]`, *optional*):
             Dict of Optional kwargs to pass when instantiating the model from a string
-        ref_model_init_kwargs: (`Optional[Dict]`, *optional*):
+        ref_model_init_kwargs (`Optional[Dict]`, *optional*):
             Dict of Optional kwargs to pass when instantiating the ref model from a string
+        model_adapter_name (`str`, defaults to `None`):
+            Name of the train target PEFT adapter, when using LoRA with multiple adapters.
+        ref_adapter_name (`str`, defaults to `None`):
+            Name of the reference PEFT adapter, when using LoRA with multiple adapters.
+        reference_free (`bool`):
+            If True, we ignore the _provided_ reference model and implicitly use a reference model that assigns equal probability to all responses.
+        force_use_ref_model (`bool`, defaults to `False`):
+            In case one passes a PEFT model for the active model and you want to use a different model for the ref_model, set this flag to `True`.
     """
 
     _tag_names = ["trl", "dpo"]
 
     def __init__(
         self,
-        model: Union[PreTrainedModel, nn.Module, str] = None,
+        model: Optional[Union[PreTrainedModel, nn.Module, str]] = None,
         ref_model: Optional[Union[PreTrainedModel, nn.Module, str]] = None,
         beta: float = 0.1,
         label_smoothing: float = 0,
-        loss_type: Literal["sigmoid", "hinge", "ipo", "kto"] = "sigmoid",
-        args: TrainingArguments = None,
+        loss_type: Literal["sigmoid", "hinge", "ipo", "kto_pair"] = "sigmoid",
+        args: Optional[TrainingArguments] = None,
         data_collator: Optional[DataCollator] = None,
         label_pad_token_id: int = -100,
-        padding_value: int = None,
+        padding_value: Optional[int] = None,
         truncation_mode: str = "keep_end",
         train_dataset: Optional[Dataset] = None,
         eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
@@ -158,8 +169,13 @@ class DPOTrainer(Trainer):
         generate_during_eval: bool = False,
         compute_metrics: Optional[Callable[[EvalLoopOutput], Dict]] = None,
         precompute_ref_log_probs: bool = False,
+        dataset_num_proc: Optional[int] = None,
         model_init_kwargs: Optional[Dict] = None,
         ref_model_init_kwargs: Optional[Dict] = None,
+        model_adapter_name: Optional[str] = None,
+        ref_adapter_name: Optional[str] = None,
+        reference_free: bool = False,
+        force_use_ref_model: bool = False,
     ):
         if model_init_kwargs is None:
             model_init_kwargs = {}
@@ -187,6 +203,10 @@ class DPOTrainer(Trainer):
             )
             ref_model = AutoModelForCausalLM.from_pretrained(ref_model, **ref_model_init_kwargs)
 
+        # Initialize this variable to False. This helps tracking the case when `peft_module_casting_to_bf16`
+        # has been called in order to properly call autocast if needed.
+        self._peft_has_been_casted_to_bf16 = False
+
         if not is_peft_available() and peft_config is not None:
             raise ValueError(
                 "PEFT is not installed and you passed a `peft_config` in the trainer's kwargs, please install it to use the PEFT models"
@@ -196,6 +216,13 @@ class DPOTrainer(Trainer):
             if isinstance(model, PeftModel):
                 model = model.merge_and_unload()
 
+            if ref_model is not None and not force_use_ref_model:
+                raise ValueError(
+                    "You passed both a ref_model and a peft_config. For training PEFT adapters with DPO there is no need to pass a reference"
+                    " model. Please pass `ref_model=None` in case you want to train PEFT adapters, or pass a ref_model with `force_use_ref_model=True` in DPOTrainer's init."
+                    " if you want to use a different ref_model."
+                )
+
             if getattr(model, "is_loaded_in_8bit", False) or getattr(model, "is_loaded_in_4bit", False):
                 _support_gc_kwargs = hasattr(
                     args, "gradient_checkpointing_kwargs"
@@ -203,12 +230,12 @@ class DPOTrainer(Trainer):
                     inspect.signature(prepare_model_for_kbit_training).parameters
                 )
 
-                preprare_model_kwargs = {"use_gradient_checkpointing": args.gradient_checkpointing}
+                prepare_model_kwargs = {"use_gradient_checkpointing": args.gradient_checkpointing}
 
                 if _support_gc_kwargs:
-                    preprare_model_kwargs["gradient_checkpointing_kwargs"] = args.gradient_checkpointing_kwargs
+                    prepare_model_kwargs["gradient_checkpointing_kwargs"] = args.gradient_checkpointing_kwargs
 
-                model = prepare_model_for_kbit_training(model, **preprare_model_kwargs)
+                model = prepare_model_for_kbit_training(model, **prepare_model_kwargs)
             elif getattr(args, "gradient_checkpointing", False):
                 # For backward compatibility with older versions of transformers
                 if hasattr(model, "enable_input_require_grads"):
@@ -224,6 +251,8 @@ class DPOTrainer(Trainer):
             model = get_peft_model(model, peft_config)
             if args.bf16 and getattr(model, "is_loaded_in_4bit", False):
                 peft_module_casting_to_bf16(model)
+                # If args.bf16 we need to explicitly call `generate` with torch amp autocast context manager
+                self._peft_has_been_casted_to_bf16 = True
 
         # For models that use gradient_checkpoiting, we need to attach a hook that enables input
         # to explicitly have `requires_grad=True`, otherwise training will either silently
@@ -253,6 +282,9 @@ class DPOTrainer(Trainer):
             self.is_encoder_decoder = is_encoder_decoder
 
         self.is_peft_model = is_peft_available() and isinstance(model, PeftModel)
+        self.model_adapter_name = model_adapter_name
+        self.ref_adapter_name = ref_adapter_name
+        self.reference_free = reference_free
 
         if ref_model:
             self.ref_model = ref_model
@@ -262,34 +294,32 @@ class DPOTrainer(Trainer):
         else:
             self.ref_model = create_reference_model(model)
 
+        if tokenizer is None:
+            raise ValueError("tokenizer must be specified to tokenize a DPO dataset.")
+        if max_length is None:
+            warnings.warn(
+                "`max_length` is not set in the DPOTrainer's init"
+                " it will default to `512` by default, but you should do it yourself in the future.",
+                UserWarning,
+            )
+            max_length = 512
+        if max_prompt_length is None:
+            warnings.warn(
+                "`max_prompt_length` is not set in the DPOTrainer's init"
+                " it will default to `128` by default, but you should do it yourself in the future.",
+                UserWarning,
+            )
+            max_prompt_length = 128
+
+        if max_target_length is None and self.is_encoder_decoder:
+            warnings.warn(
+                "When using an encoder decoder architecture, you should set `max_target_length` in the DPOTrainer's init"
+                " it will default to `128` by default, but you should do it yourself in the future.",
+                UserWarning,
+            )
+            max_target_length = 128
+
         if data_collator is None:
-            if tokenizer is None:
-                raise ValueError(
-                    "max_length or a tokenizer must be specified when using the default DPODataCollatorWithPadding"
-                )
-            if max_length is None:
-                warnings.warn(
-                    "When using DPODataCollatorWithPadding, you should set `max_length` in the DPOTrainer's init"
-                    " it will be set to `512` by default, but you should do it yourself in the future.",
-                    UserWarning,
-                )
-                max_length = 512
-            if max_prompt_length is None:
-                warnings.warn(
-                    "When using DPODataCollatorWithPadding, you should set `max_prompt_length` in the DPOTrainer's init"
-                    " it will be set to `128` by default, but you should do it yourself in the future.",
-                    UserWarning,
-                )
-                max_prompt_length = 128
-
-            if max_target_length is None and self.is_encoder_decoder:
-                warnings.warn(
-                    "When using DPODataCollatorWithPadding with an encoder decoder architecture, you should set `max_target_length` in the DPOTrainer's init"
-                    " it will be set to `128` by default, but you should do it yourself in the future.",
-                    UserWarning,
-                )
-                max_target_length = 128
-
             data_collator = DPODataCollatorWithPadding(
                 pad_token_id=tokenizer.pad_token_id,
                 label_pad_token_id=label_pad_token_id,
@@ -340,10 +370,15 @@ class DPOTrainer(Trainer):
 
         self._stored_metrics = defaultdict(lambda: defaultdict(list))
 
-        # tokenize the dataset
-        train_dataset = train_dataset.map(self.tokenize_row)
-        if eval_dataset is not None:
-            eval_dataset = eval_dataset.map(self.tokenize_row)
+        self.dataset_num_proc = dataset_num_proc
+
+        # Compute that only on the main process for faster data processing.
+        # see: https://github.com/huggingface/trl/pull/1255
+        with PartialState().local_main_process_first():
+            # tokenize the dataset
+            train_dataset = train_dataset.map(self.tokenize_row, num_proc=self.dataset_num_proc)
+            if eval_dataset is not None:
+                eval_dataset = eval_dataset.map(self.tokenize_row, num_proc=self.dataset_num_proc)
 
         super().__init__(
             model=model,
@@ -358,6 +393,10 @@ class DPOTrainer(Trainer):
             optimizers=optimizers,
             preprocess_logits_for_metrics=preprocess_logits_for_metrics,
         )
+
+        # Add tags for models that have been loaded with the correct transformers version
+        if hasattr(self.model, "add_model_tags"):
+            self.model.add_model_tags(self._tag_names)
 
         if not hasattr(self, "accelerator"):
             raise AttributeError(
@@ -558,7 +597,7 @@ class DPOTrainer(Trainer):
             attention_mask=answer_attention_mask,
         )
 
-    def tokenize_row(self, feature, model: Union[PreTrainedModel, nn.Module] = None) -> Dict:
+    def tokenize_row(self, feature, model: Optional[Union[PreTrainedModel, nn.Module]] = None) -> Dict:
         """Tokenize a single row from a DPO specific dataset.
 
         At this stage, we don't convert to PyTorch tensors yet; we just handle the truncation
@@ -592,6 +631,29 @@ class DPOTrainer(Trainer):
             if not isinstance(rejected, str):
                 raise ValueError(f"rejected should be an str but got {type(rejected)}")
             rejected_tokens = self.build_tokenized_answer(prompt, rejected)
+
+            # Last prompt token might get merged by tokenizer and
+            # it should not be included for generation if that happens
+            prompt_len_input_ids = len(prompt_tokens["prompt_input_ids"])
+
+            chosen_prompt_len_input_ids = len(chosen_tokens["prompt_input_ids"])
+            rejected_prompt_len_input_ids = len(rejected_tokens["prompt_input_ids"])
+            prompt_len_input_ids = min(chosen_prompt_len_input_ids, rejected_prompt_len_input_ids)
+
+            for k, v in prompt_tokens.items():
+                prompt_tokens[k] = v[:prompt_len_input_ids]
+
+            # Make sure prompts only have one different token at most an
+            # and length only differs by 1 at most
+            num_diff_tokens = sum(
+                [a != b for a, b in zip(chosen_tokens["prompt_input_ids"], rejected_tokens["prompt_input_ids"])]
+            )
+            num_diff_len = abs(chosen_prompt_len_input_ids - rejected_prompt_len_input_ids)
+            if num_diff_tokens > 1 or num_diff_len > 1:
+                raise ValueError(
+                    "Chosen and rejected prompt_input_ids might only differ on the "
+                    "last token due to tokenizer merge ops."
+                )
 
             # add BOS token to head of prompt
             prompt_tokens["prompt_input_ids"] = [self.tokenizer.bos_token_id] + prompt_tokens["prompt_input_ids"]
@@ -673,22 +735,34 @@ class DPOTrainer(Trainer):
 
             if model is not None and hasattr(model, "prepare_decoder_input_ids_from_labels"):
                 batch["rejected_decoder_input_ids"] = model.prepare_decoder_input_ids_from_labels(
-                    labels=batch["rejected_labels"]
+                    labels=torch.tensor(batch["rejected_labels"])
                 )
                 batch["chosen_decoder_input_ids"] = model.prepare_decoder_input_ids_from_labels(
-                    labels=batch["chosen_labels"]
+                    labels=torch.tensor(batch["chosen_labels"])
                 )
 
         return batch
 
+    @contextmanager
+    def null_ref_context(self):
+        """Context manager for handling null reference model (that is, peft adapter manipulation)."""
+        with self.accelerator.unwrap_model(
+            self.model
+        ).disable_adapter() if self.is_peft_model and not self.ref_adapter_name else nullcontext():
+            if self.ref_adapter_name:
+                self.model.set_adapter(self.ref_adapter_name)
+            yield
+            if self.ref_adapter_name:
+                self.model.set_adapter(self.model_adapter_name or "default")
+
     def compute_reference_log_probs(self, padded_batch: Dict) -> Dict:
         """Computes log probabilities of the reference model for a single padded batch of a DPO specific dataset."""
+        compte_ref_context_manager = torch.cuda.amp.autocast if self._peft_has_been_casted_to_bf16 else nullcontext
+
         # compute reference logps
-        with torch.no_grad():
+        with torch.no_grad(), compte_ref_context_manager():
             if self.ref_model is None:
-                with self.accelerator.unwrap_model(
-                    self.model
-                ).disable_adapter() if self.is_peft_model else nullcontext():
+                with self.null_ref_context():
                     (
                         reference_chosen_logps,
                         reference_rejected_logps,
@@ -773,7 +847,6 @@ class DPOTrainer(Trainer):
         policy_rejected_logps: torch.FloatTensor,
         reference_chosen_logps: torch.FloatTensor,
         reference_rejected_logps: torch.FloatTensor,
-        reference_free: bool = False,
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
         """Compute the DPO loss for a batch of policy and reference model log probabilities.
 
@@ -782,7 +855,6 @@ class DPOTrainer(Trainer):
             policy_rejected_logps: Log probabilities of the policy model for the rejected responses. Shape: (batch_size,)
             reference_chosen_logps: Log probabilities of the reference model for the chosen responses. Shape: (batch_size,)
             reference_rejected_logps: Log probabilities of the reference model for the rejected responses. Shape: (batch_size,)
-            reference_free: If True, we ignore the _provided_ reference model and implicitly use a reference model that assigns equal probability to all responses.
 
         Returns:
             A tuple of three tensors: (losses, chosen_rewards, rejected_rewards).
@@ -790,11 +862,13 @@ class DPOTrainer(Trainer):
             The chosen_rewards and rejected_rewards tensors contain the rewards for the chosen and rejected responses, respectively.
         """
         pi_logratios = policy_chosen_logps - policy_rejected_logps
-        if reference_free:
-            ref_logratios = 0
+        if self.reference_free:
+            ref_logratios = torch.tensor([0], dtype=pi_logratios.dtype, device=pi_logratios.device)
         else:
             ref_logratios = reference_chosen_logps - reference_rejected_logps
 
+        pi_logratios = pi_logratios.to(self.accelerator.device)
+        ref_logratios = ref_logratios.to(self.accelerator.device)
         logits = pi_logratios - ref_logratios
 
         # The beta is a temperature parameter for the DPO loss, typically something in the range of 0.1 to 0.5.
@@ -830,8 +904,19 @@ class DPOTrainer(Trainer):
                 f"Unknown loss type: {self.loss_type}. Should be one of ['sigmoid', 'hinge', 'ipo', 'kto_pair']"
             )
 
-        chosen_rewards = self.beta * (policy_chosen_logps - reference_chosen_logps).detach()
-        rejected_rewards = self.beta * (policy_rejected_logps - reference_rejected_logps).detach()
+        chosen_rewards = (
+            self.beta
+            * (
+                policy_chosen_logps.to(self.accelerator.device) - reference_chosen_logps.to(self.accelerator.device)
+            ).detach()
+        )
+        rejected_rewards = (
+            self.beta
+            * (
+                policy_rejected_logps.to(self.accelerator.device)
+                - reference_rejected_logps.to(self.accelerator.device)
+            ).detach()
+        )
 
         return losses, chosen_rewards, rejected_rewards
 
@@ -849,6 +934,8 @@ class DPOTrainer(Trainer):
             logits: Logits of the model (unnormalized). Shape: (batch_size, sequence_length, vocab_size)
             labels: Labels for which to compute the log probabilities. Label tokens with a value of label_pad_token_id are ignored. Shape: (batch_size, sequence_length)
             average_log_prob: If True, return the average log probability per (non-masked) token. Otherwise, return the sum of the log probabilities of the (non-masked) tokens.
+            label_pad_token_id: The label pad token id.
+            is_encoder_decoder: Whether the model is an encoder-decoder model.
 
         Returns:
             A tensor of shape (batch_size,) containing the average/sum log probabilities of the given labels under the given logits.
@@ -898,13 +985,14 @@ class DPOTrainer(Trainer):
         all_logits = model(
             concatenated_batch["concatenated_input_ids"],
             attention_mask=concatenated_batch["concatenated_attention_mask"],
+            use_cache=False,
             **model_kwargs,
         ).logits
 
         all_logps = self.get_batch_logps(
             all_logits,
             concatenated_batch["concatenated_labels"],
-            average_log_prob=False,
+            average_log_prob=self.loss_type == "ipo",
             is_encoder_decoder=self.is_encoder_decoder,
             label_pad_token_id=self.label_pad_token_id,
         )
@@ -940,7 +1028,7 @@ class DPOTrainer(Trainer):
         else:
             with torch.no_grad():
                 if self.ref_model is None:
-                    with self.accelerator.unwrap_model(self.model).disable_adapter():
+                    with self.null_ref_context():
                         (
                             reference_chosen_logps,
                             reference_rejected_logps,
@@ -964,14 +1052,14 @@ class DPOTrainer(Trainer):
         reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
         prefix = "eval_" if train_eval == "eval" else ""
-        metrics[f"{prefix}rewards/chosen"] = chosen_rewards.cpu().mean()
-        metrics[f"{prefix}rewards/rejected"] = rejected_rewards.cpu().mean()
-        metrics[f"{prefix}rewards/accuracies"] = reward_accuracies.cpu().mean()
-        metrics[f"{prefix}rewards/margins"] = (chosen_rewards - rejected_rewards).cpu().mean()
-        metrics[f"{prefix}logps/rejected"] = policy_rejected_logps.detach().cpu().mean()
-        metrics[f"{prefix}logps/chosen"] = policy_chosen_logps.detach().cpu().mean()
-        metrics[f"{prefix}logits/rejected"] = policy_rejected_logits.detach().cpu().mean()
-        metrics[f"{prefix}logits/chosen"] = policy_chosen_logits.detach().cpu().mean()
+        metrics[f"{prefix}rewards/chosen"] = chosen_rewards.mean().cpu()
+        metrics[f"{prefix}rewards/rejected"] = rejected_rewards.mean().cpu()
+        metrics[f"{prefix}rewards/accuracies"] = reward_accuracies.mean().cpu()
+        metrics[f"{prefix}rewards/margins"] = (chosen_rewards - rejected_rewards).mean().cpu()
+        metrics[f"{prefix}logps/rejected"] = policy_rejected_logps.detach().mean().cpu()
+        metrics[f"{prefix}logps/chosen"] = policy_chosen_logps.detach().mean().cpu()
+        metrics[f"{prefix}logits/rejected"] = policy_rejected_logits.detach().mean().cpu()
+        metrics[f"{prefix}logits/chosen"] = policy_chosen_logits.detach().mean().cpu()
 
         return losses.mean(), metrics
 
@@ -986,11 +1074,14 @@ class DPOTrainer(Trainer):
                 "compute_loss is only implemented for DPODataCollatorWithPadding, and you passed a datacollator that is different than "
                 "DPODataCollatorWithPadding - you might see unexpected behavior. Alternatively, you can implement your own prediction_step method if you are using a custom data collator"
             )
-        loss, metrics = self.get_batch_loss_metrics(model, inputs, train_eval="train")
+
+        compute_loss_context_manager = torch.cuda.amp.autocast if self._peft_has_been_casted_to_bf16 else nullcontext
+
+        with compute_loss_context_manager():
+            loss, metrics = self.get_batch_loss_metrics(model, inputs, train_eval="train")
 
         # force log the metrics
-        if self.accelerator.is_main_process:
-            self.store_metrics(metrics, train_eval="train")
+        self.store_metrics(metrics, train_eval="train")
 
         if return_outputs:
             return (loss, metrics)
@@ -999,35 +1090,40 @@ class DPOTrainer(Trainer):
     def get_batch_samples(self, model, batch: Dict[str, torch.LongTensor]) -> Tuple[str, str]:
         """Generate samples from the model and reference model for the given batch of inputs."""
 
-        policy_output = model.generate(
-            input_ids=batch["prompt_input_ids"],
-            attention_mask=batch["prompt_attention_mask"],
-            max_length=self.max_length,
-            do_sample=True,
-            pad_token_id=self.tokenizer.pad_token_id,
-        )
+        # If one uses `generate_during_eval` with peft + bf16, we need to explictly call generate with
+        # the torch cuda amp context manager as some hidden states are silently casted to full precision.
+        generate_context_manager = nullcontext if not self._peft_has_been_casted_to_bf16 else torch.cuda.amp.autocast
 
-        # if reference_output in batch use that otherwise use the reference model
-        if "reference_output" in batch:
-            reference_output = batch["reference_output"]
-        else:
-            if self.ref_model is None:
-                with self.accelerator.unwrap_model(self.model).disable_adapter():
-                    reference_output = self.model.generate(
+        with generate_context_manager():
+            policy_output = model.generate(
+                input_ids=batch["prompt_input_ids"],
+                attention_mask=batch["prompt_attention_mask"],
+                max_length=self.max_length,
+                do_sample=True,
+                pad_token_id=self.tokenizer.pad_token_id,
+            )
+
+            # if reference_output in batch use that otherwise use the reference model
+            if "reference_output" in batch:
+                reference_output = batch["reference_output"]
+            else:
+                if self.ref_model is None:
+                    with self.null_ref_context():
+                        reference_output = self.model.generate(
+                            input_ids=batch["prompt_input_ids"],
+                            attention_mask=batch["prompt_attention_mask"],
+                            max_length=self.max_length,
+                            do_sample=True,
+                            pad_token_id=self.tokenizer.pad_token_id,
+                        )
+                else:
+                    reference_output = self.ref_model.generate(
                         input_ids=batch["prompt_input_ids"],
                         attention_mask=batch["prompt_attention_mask"],
                         max_length=self.max_length,
                         do_sample=True,
                         pad_token_id=self.tokenizer.pad_token_id,
                     )
-            else:
-                reference_output = self.ref_model.generate(
-                    input_ids=batch["prompt_input_ids"],
-                    attention_mask=batch["prompt_attention_mask"],
-                    max_length=self.max_length,
-                    do_sample=True,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                )
 
         policy_output = pad_to_length(policy_output, self.max_length, self.tokenizer.pad_token_id)
         policy_output_decoded = self.tokenizer.batch_decode(policy_output, skip_special_tokens=True)
@@ -1055,12 +1151,13 @@ class DPOTrainer(Trainer):
             else:
                 ignore_keys = []
 
-        with torch.no_grad():
+        prediction_context_manager = torch.cuda.amp.autocast if self._peft_has_been_casted_to_bf16 else nullcontext
+
+        with torch.no_grad(), prediction_context_manager():
             loss, metrics = self.get_batch_loss_metrics(model, inputs, train_eval="eval")
 
         # force log the metrics
-        if self.accelerator.is_main_process:
-            self.store_metrics(metrics, train_eval="eval")
+        self.store_metrics(metrics, train_eval="eval")
 
         if prediction_loss_only:
             return (loss.detach(), None, None)

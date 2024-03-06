@@ -19,6 +19,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from accelerate.state import PartialState
 from datasets import Dataset
 from datasets.arrow_writer import SchemaInferenceError
 from datasets.builder import DatasetGenerationError
@@ -36,6 +37,7 @@ from transformers.modeling_utils import unwrap_model
 from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import EvalPrediction
 
+from ..extras.dataset_formatting import get_formatting_func_from_dataset
 from ..import_utils import is_peft_available
 from .utils import (
     ConstantLengthDataset,
@@ -91,7 +93,7 @@ class SFTTrainer(Trainer):
         formatting_func (`Optional[Callable]`):
             The formatting function to be used for creating the `ConstantLengthDataset`.
         max_seq_length (`Optional[int]`):
-            The maximum sequence length to use for the `ConstantLengthDataset` and for automaticallty creating the Dataset. Defaults to `512`.
+            The maximum sequence length to use for the `ConstantLengthDataset` and for automatically creating the Dataset. Defaults to `512`.
         infinite (`Optional[bool]`):
             Whether to use an infinite dataset or not. Defaults to `False`.
         num_of_sequences (`Optional[int]`):
@@ -108,20 +110,23 @@ class SFTTrainer(Trainer):
             The number of examples to tokenize per batch. If batch_size <= 0 or batch_size == None,
             tokenize the full dataset as a single batch. Defaults to 1000.
         neftune_noise_alpha (`Optional[float]`):
-            If not `None`, this will activate NEFTune noise embeddings. This has been proven to drastically improve model performances for instrcution
+            If not `None`, this will activate NEFTune noise embeddings. This has been proven to drastically improve model performances for instruction
             fine-tuning. Check out the original paper here: https://arxiv.org/abs/2310.05914 and the original code here: https://github.com/neelsjain/NEFTune
         model_init_kwargs: (`Optional[Dict]`, *optional*):
             Dict of Optional kwargs to pass when instantiating the model from a string
         dataset_kwargs: (`Optional[Dict]`, *optional*):
             Dict of Optional kwargs to pass when creating packed or non-packed datasets
+        eval_packing: (`Optional[bool]`, *optional*):
+            Whether to pack the eval dataset as well. Defaults to `packing` if `None` is passed.
     """
+
     _tag_names = ["trl", "sft"]
 
     def __init__(
         self,
-        model: Union[PreTrainedModel, nn.Module, str] = None,
-        args: TrainingArguments = None,
-        data_collator: Optional[DataCollator] = None,
+        model: Optional[Union[PreTrainedModel, nn.Module, str]] = None,
+        args: Optional[TrainingArguments] = None,
+        data_collator: Optional[DataCollator] = None,  # type: ignore
         train_dataset: Optional[Dataset] = None,
         eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
         tokenizer: Optional[PreTrainedTokenizerBase] = None,
@@ -143,6 +148,7 @@ class SFTTrainer(Trainer):
         neftune_noise_alpha: Optional[float] = None,
         model_init_kwargs: Optional[Dict] = None,
         dataset_kwargs: Optional[Dict] = None,
+        eval_packing: Optional[bool] = None,
     ):
         if model_init_kwargs is None:
             model_init_kwargs = {}
@@ -181,14 +187,14 @@ class SFTTrainer(Trainer):
                 )
                 gradient_checkpointing_kwargs = getattr(args, "gradient_checkpointing_kwargs", None) or {}
                 if getattr(model, "is_loaded_in_8bit", False) or getattr(model, "is_loaded_in_4bit", False):
-                    preprare_model_kwargs = {
+                    prepare_model_kwargs = {
                         "use_gradient_checkpointing": getattr(args, "gradient_checkpointing", False)
                     }
 
                     if _support_gc_kwargs:
-                        preprare_model_kwargs["gradient_checkpointing_kwargs"] = gradient_checkpointing_kwargs
+                        prepare_model_kwargs["gradient_checkpointing_kwargs"] = gradient_checkpointing_kwargs
 
-                    model = prepare_model_for_kbit_training(model, **preprare_model_kwargs)
+                    model = prepare_model_for_kbit_training(model, **prepare_model_kwargs)
 
                     if args is not None:
                         args = dataclasses.replace(args, gradient_checkpointing=False)
@@ -207,7 +213,7 @@ class SFTTrainer(Trainer):
                         model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
                 model = get_peft_model(model, peft_config)
-                if args.bf16 and getattr(model, "is_loaded_in_4bit", False):
+                if args is not None and args.bf16 and getattr(model, "is_loaded_in_4bit", False):
                     peft_module_casting_to_bf16(model)
 
         if tokenizer is None:
@@ -237,6 +243,11 @@ class SFTTrainer(Trainer):
         elif not self._trainer_supports_neftune:
             self.neftune_noise_alpha = neftune_noise_alpha
 
+        if formatting_func is None and dataset_text_field is None:
+            # check if dataset has ChatML format or instruction format and is supported
+            # if not stays #None
+            formatting_func = get_formatting_func_from_dataset(train_dataset, tokenizer)
+
         if not packing:
             if dataset_text_field is None and formatting_func is None:
                 raise ValueError(
@@ -246,26 +257,13 @@ class SFTTrainer(Trainer):
             if data_collator is None:
                 data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
-        if dataset_kwargs is None:
-            dataset_kwargs = {}
-        if train_dataset is not None:
-            train_dataset = self._prepare_dataset(
-                train_dataset,
-                tokenizer,
-                packing,
-                dataset_text_field,
-                max_seq_length,
-                formatting_func,
-                num_of_sequences,
-                chars_per_token,
-                **dataset_kwargs,
-            )
-        if eval_dataset is not None:
-            _multiple = isinstance(eval_dataset, dict)
-            _eval_datasets = eval_dataset if _multiple else {"singleton": eval_dataset}
-            for _eval_dataset_name, _eval_dataset in _eval_datasets.items():
-                _eval_datasets[_eval_dataset_name] = self._prepare_dataset(
-                    _eval_dataset,
+        # Pre-process the datasets only once per node. The remaining processes will use the cache.
+        with PartialState().local_main_process_first():
+            if dataset_kwargs is None:
+                dataset_kwargs = {}
+            if train_dataset is not None:
+                train_dataset = self._prepare_dataset(
+                    train_dataset,
                     tokenizer,
                     packing,
                     dataset_text_field,
@@ -273,10 +271,30 @@ class SFTTrainer(Trainer):
                     formatting_func,
                     num_of_sequences,
                     chars_per_token,
+                    remove_unused_columns=args.remove_unused_columns if args is not None else True,
                     **dataset_kwargs,
                 )
-            if not _multiple:
-                eval_dataset = _eval_datasets["singleton"]
+            if eval_dataset is not None:
+                _multiple = isinstance(eval_dataset, dict)
+                _eval_datasets = eval_dataset if _multiple else {"singleton": eval_dataset}
+
+                eval_packing = packing if eval_packing is None else eval_packing
+
+                for _eval_dataset_name, _eval_dataset in _eval_datasets.items():
+                    _eval_datasets[_eval_dataset_name] = self._prepare_dataset(
+                        _eval_dataset,
+                        tokenizer,
+                        eval_packing,
+                        dataset_text_field,
+                        max_seq_length,
+                        formatting_func,
+                        num_of_sequences,
+                        chars_per_token,
+                        remove_unused_columns=args.remove_unused_columns if args is not None else True,
+                        **dataset_kwargs,
+                    )
+                if not _multiple:
+                    eval_dataset = _eval_datasets["singleton"]
 
         if tokenizer.padding_side is not None and tokenizer.padding_side != "right":
             warnings.warn(
@@ -297,6 +315,10 @@ class SFTTrainer(Trainer):
             optimizers=optimizers,
             preprocess_logits_for_metrics=preprocess_logits_for_metrics,
         )
+
+        # Add tags for models that have been loaded with the correct transformers version
+        if hasattr(self.model, "add_model_tags"):
+            self.model.add_model_tags(self._tag_names)
 
         if self.args.max_steps > 0 and packing:
             warnings.warn(
@@ -348,6 +370,7 @@ class SFTTrainer(Trainer):
         formatting_func,
         num_of_sequences,
         chars_per_token,
+        remove_unused_columns=True,
         append_concat_token=True,
         add_special_tokens=True,
     ):
@@ -360,7 +383,13 @@ class SFTTrainer(Trainer):
 
         if not packing:
             return self._prepare_non_packed_dataloader(
-                tokenizer, dataset, dataset_text_field, max_seq_length, formatting_func, add_special_tokens
+                tokenizer,
+                dataset,
+                dataset_text_field,
+                max_seq_length,
+                formatting_func,
+                add_special_tokens,
+                remove_unused_columns,
             )
 
         else:
@@ -377,7 +406,14 @@ class SFTTrainer(Trainer):
             )
 
     def _prepare_non_packed_dataloader(
-        self, tokenizer, dataset, dataset_text_field, max_seq_length, formatting_func=None, add_special_tokens=True
+        self,
+        tokenizer,
+        dataset,
+        dataset_text_field,
+        max_seq_length,
+        formatting_func=None,
+        add_special_tokens=True,
+        remove_unused_columns=True,
     ):
         use_formatting_func = formatting_func is not None and dataset_text_field is None
         self._dataset_sanity_checked = False
@@ -404,10 +440,20 @@ class SFTTrainer(Trainer):
 
             return {"input_ids": outputs["input_ids"], "attention_mask": outputs["attention_mask"]}
 
+        signature_columns = ["input_ids", "labels", "attention_mask"]
+
+        extra_columns = list(set(dataset.column_names) - set(signature_columns))
+
+        if not remove_unused_columns and len(extra_columns) > 0:
+            warnings.warn(
+                "You passed `remove_unused_columns=False` on a non-packed dataset. This might create some issues with the default collator and yield to errors. If you want to "
+                f"inspect dataset other columns (in this case {extra_columns}), you can subclass `DataCollatorForLanguageModeling` in case you used the default collator and create your own data collator in order to inspect the unused dataset columns."
+            )
+
         tokenized_dataset = dataset.map(
             tokenize,
             batched=True,
-            remove_columns=dataset.column_names,
+            remove_columns=dataset.column_names if remove_unused_columns else None,
             num_proc=self.dataset_num_proc,
             batch_size=self.dataset_batch_size,
         )
@@ -445,17 +491,17 @@ class SFTTrainer(Trainer):
             )
 
             def data_generator(constant_length_iterator):
-                for i in constant_length_iterator:
-                    yield i
+                yield from constant_length_iterator
 
             try:
                 packed_dataset = Dataset.from_generator(
                     data_generator, gen_kwargs={"constant_length_iterator": constant_length_iterator}
                 )
-            except (DatasetGenerationError, SchemaInferenceError):
+            except (DatasetGenerationError, SchemaInferenceError) as exc:
                 raise ValueError(
-                    "Error occurred while packing the dataset. Make sure that your dataset has enough samples to at least yield one packed sequence."
-                )
+                    "Error occurred while packing the dataset. "
+                    "Make sure that your dataset has enough samples to at least yield one packed sequence."
+                ) from exc
             return packed_dataset
         else:
             raise ValueError(
